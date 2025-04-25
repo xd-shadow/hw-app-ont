@@ -1,3 +1,5 @@
+    
+const {convertPathToBuffer} = require("./utils");
 const STATUS_CODES = {
   SW_DENY: 0x6985,
   SW_WRONG_P1P2: 0x6a86,
@@ -31,10 +33,12 @@ const P2_EXTEND = 0x00;
 
 const INS = {
   GET_VERSION: 0x03,
-  GET_ADDR: 0x05,
+  GET_ADDR: 0x04,
   SIGN: 0x02,
   SIGN_OFFCHAIN: 0x07,
 };
+
+
 
 class Ont {
   constructor(transport, scrambleKey = "ONT") {
@@ -42,9 +46,11 @@ class Ont {
     transport.decorateAppAPIMethods(this, ["getPublicKey", "signMessage", "signOffchainMessage"], scrambleKey);
   }
   async #sendToDevice(path, instruction, msgBuffer) {
+    console.log("sendToDevice");
+    
     console.log(path, instruction, msgBuffer);
-    const versionReply = await this.getVersion();
-    if (versionReply.toString("hex") !== "0102059000") {
+    const checkedVersion = await this.checkVersion();
+    if(!checkedVersion){
       throw new Error("Unsupported app version");
     }
 
@@ -123,54 +129,126 @@ class Ont {
     if (r_length === 33 && r[0] === 0) {
       r = r.slice(1);
     }
+    let s_length= dataBuf[r_length + 5];
     let s = dataBuf.slice(r_length + 6);
+    if(s_length=== 33 && s[0] === 0){
+      s = s.slice(1);
+    }
 
     const sign = Buffer.concat([r, s]).toString("hex");
     return sign;
   }
 
   async getVersion() {
-    const result = await this.transport.send(LEDGER_CLA, INS.GET_VERSION, P1_NON_CONFIRM, P2_EXTEND, Buffer.alloc(0), [
-      STATUS_CODES.OK,
-    ]);
-    return result;
+    try {
+      const result = await this.transport.send(LEDGER_CLA, INS.GET_VERSION, P1_NON_CONFIRM, P2_EXTEND, Buffer.alloc(0), [
+        STATUS_CODES.OK,
+      ]);
+      return result;
+    } catch (error) {
+      if(error.statusCode===STATUS_CODES.SW_INS_NOT_SUPPORTED){
+        return '0000009000'
+      }
+      throw this._convertTransportError(error);
+    }
+  }
+
+  /**
+   * Checks if the version meets the required criteria.·
+   * This function retrieves the version, converts it to a hexadecimal string,
+   * and checks if the first two characters represent a number greater than or equal to 2.
+   *
+   * @returns {Promise<boolean>} - A Promise that resolves to a boolean indicating
+   * whether the version is greater than or equal to 2.
+   */
+  async checkVersion() {
+    const versionReply = await this.getVersion();
+    const versionString = versionReply.toString("hex");
+    console.log("versionString", versionString);
+    
+    const first = versionString.slice(0, 2);
+    if (Number(first) >= 2) {
+      return true;
+    }
+    return false;
   }
 
   async getPublicKey(path) {
     try {
-      const pathBuffer = this.#pathToBuffer(path);
-      let result = await this.transport.send(LEDGER_CLA, INS.GET_ADDR, P1_NON_CONFIRM, P2_EXTEND, pathBuffer, [
-        STATUS_CODES.OK,
-      ]);
-      result = result.slice(1, result[0] + 1);
-      return result.toString("hex");
+     
+      const checkedVersion = await this.checkVersion();
+      console.log('checkedVersion', checkedVersion);
+      
+      if (!checkedVersion) {
+        let pathBuffer = convertPathToBuffer(path);
+        const result = await this.transport.send(0x80, 0x04, 0x00, 0x00, pathBuffer, [STATUS_CODES.OK]);
+        return result.toString('hex').substring(0, 130);
+      }else{
+        const pathBuffer = this.#pathToBuffer(path);
+        let result = await this.transport.send(LEDGER_CLA, INS.GET_ADDR, P1_NON_CONFIRM, P2_EXTEND, pathBuffer, [
+          STATUS_CODES.OK,
+        ]);
+        
+        result = result.slice(1, result[0] + 1);
+        return result.toString("hex");
+      }
+   
     } catch (error) {
+      console.log(error);
+      
       throw this._convertTransportError(error);
     }
   }
 
   async signMessage(path, msg) {
+    const checkedVersion = await this.checkVersion();
+    console.log('checkedVersion', checkedVersion);
+    
+    if (!checkedVersion) {
+      const pathBuffer = convertPathToBuffer(path);
+      const data = msg + pathBuffer.toString('hex');
+      const chunks = data.match(/.{1,500}/g) || [];
+      if (chunks.length === 0) {
+        throw new Error(`Invalid data provided: ${data}`);
+      }
+
+      let result = null;
+      for (let i = 0; i < chunks.length; i++) {
+        const p1 = i === chunks.length - 1 ? 0x80 : 0x00;
+        const chunk = Buffer.from(chunks[i], 'hex');
+        result = await this.transport.send(0x80, 0x02, p1, 0x00, chunk, [STATUS_CODES.OK]);
+      }
+      const dataLength = result[1];
+      const dataBuf = result.slice(2, dataLength + 2);
+      const r_length = dataBuf[1];
+      let r = dataBuf.slice(2, 2 + r_length);
+      if (r_length === 33 && r[0] === 0) {
+        r = r.slice(1);
+      }
+      let s = dataBuf.slice(r_length + 4);
+      if(s.length === 33 && s[0] === 0){
+        s = s.slice(1);
+      }
+      const sign = Buffer.concat([r, s]).toString("hex");
+      return sign;
+    }
     const msgBuffer = Buffer.from(msg, "hex");
     const reply = await this.#sendToDevice(path, INS.SIGN, msgBuffer);
 
     if (reply <= 2) {
       throw new Error("No more data but Ledger did not return signature!");
     }
-    const dataLength = reply[0];
-    const dataBuf = reply.slice(1, dataLength + 1);
-
-    let r_length = dataBuf[3];
-    let r = dataBuf.slice(4, 4 + r_length);
-    if (r_length === 33 && r[0] === 0) {
-      r = r.slice(1);
-    }
-    let s = dataBuf.slice(r_length + 6);
-
-    const sign = Buffer.concat([r, s]).toString("hex");
+    console.log("reply", reply.toString("hex"));
+    
+    const sign=this.#getSignFromRelay(reply)
     return sign;
   }
 
   async signOffchainMessage(path, msg) {
+    const checkedVersion = await this.checkVersion();
+    if (!checkedVersion) {
+      throw new Error("Unsupported app version");
+    }
     const msgBuffer = Buffer.from(msg, "hex");
 
     const relay = await this.#sendToDevice(path, INS.SIGN_OFFCHAIN, msgBuffer);
